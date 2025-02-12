@@ -5,9 +5,25 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, Union, List
 from dataclasses import dataclass
 
+
+# ---------------------------------------------------------------------------
+# Configuration dataclasses
+# ---------------------------------------------------------------------------
+
 @dataclass
 class EncoderConfig:
-    """Configuration for encoder modules."""
+    """
+    Configuration for the MelEncoder.
+    
+    Attributes:
+        window_size (int): The temporal window size of the input.
+        embedding_size (int): The size of the latent embedding.
+        hidden_size (int): The size of the hidden layer before producing latent parameters.
+        conv1_channels (int): Number of output channels for the first convolution.
+        conv2_channels (int): Number of output channels for the second convolution.
+        kernel_size (int): Size of the convolution kernel.
+        padding (int): Padding size for the convolutions.
+    """
     window_size: int
     embedding_size: int
     hidden_size: int = 512
@@ -15,12 +31,24 @@ class EncoderConfig:
     conv2_channels: int = 32
     kernel_size: int = 3
     padding: int = 1
-    pool_size: int = 2
 
 
 @dataclass
 class EnergyMapConfig:
-    """Configuration for energy map encoder."""
+    """
+    Configuration for the EnergyMapEncoder.
+    
+    Attributes:
+        window_size (int): The temporal window size of the input.
+        height (int): The spatial height of the input energy map.
+        width (int): The spatial width of the input energy map.
+        embedding_size (int): The size of the latent embedding.
+        hidden_size (int): The size of the hidden layer before producing latent parameters.
+        conv1_channels (int): Number of output channels for the first convolution.
+        conv2_channels (int): Number of output channels for the second convolution.
+        kernel_size (int): Size of the convolution kernel.
+        padding (int): Padding size for the convolutions.
+    """
     window_size: int
     height: int
     width: int
@@ -30,19 +58,28 @@ class EnergyMapConfig:
     conv2_channels: int = 32
     kernel_size: int = 3
     padding: int = 1
-    pool_size: int = 2
+
 
 @dataclass
 class DecoderConfig:
-    """Configuration for hierarchical decoder."""
-    window_size: int
-    num_mel_bins: int
-    height: int
-    width: int
-    embedding_size: int
-    hidden_size: int = 512
+    """
+    Configuration for the hierarchical decoder.
+    
+    Note: Instead of assuming the unflatten shape is determined by dividing the
+    final output size by 4, we introduce an intermediate resolution (e.g. an
+    arbitrary “bottleneck” size) that is later upsampled to the target.
+    """
+    window_size: int         # Final output temporal dimension
+    num_mel_bins: int        # Final output mel frequency dimension
+    height: int              # Final output spatial height for energy map
+    width: int               # Final output spatial width for energy map
+    embedding_size: int      # Latent embedding size per modality
+    hidden_size: int = 512   # Hidden layer size after the FC layer
     shared_hidden_size: int = 1024
-    conv_channels: int = 32
+    conv_channels: int = 32  # Number of channels to use in the intermediate representation
+    # New optional parameters for intermediate resolution:
+    mel_intermediate: tuple = (4, 4)    # (H, W) for mel branch (can be arbitrary)
+    energy_intermediate: tuple = (4, 4, 4)  # (D, H, W) for energy branch
 
 
 
@@ -74,232 +111,355 @@ class HybridModelConfig:
 
 
 
+# ---------------------------------------------------------------------------
+# MelEncoder using AdaptiveAvgPool2d
+# ---------------------------------------------------------------------------
 
-
-class BaseEncoder(nn.Module, ABC):
-    """Abstract base class for encoders."""
-    
-    @abstractmethod
-    def reparameterize(self, z_mean: torch.Tensor, z_log_var: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick implementation."""
-        pass
-
-    @staticmethod
-    def validate_inputs(window_size: int, embedding_size: int) -> None:
-        """Validate input parameters."""
-        if window_size <= 0 or embedding_size <= 0:
-            raise ValueError("Window size and embedding size must be positive integers")
-
-class MelEncoder(BaseEncoder):
-    """Encoder for 2D Mel Spectrogram windows."""
-
+class MelEncoder(nn.Module):
+    """
+    Encoder for 2D Mel Spectrogram windows that uses AdaptiveAvgPool2d
+    to ensure a fixed-size feature vector prior to the fully connected layers.
+    """
     def __init__(self, config: EncoderConfig, num_mel_bins: int):
-        """Initialize the MelEncoder."""
+        """
+        Initialize the MelEncoder.
+        
+        Args:
+            config (EncoderConfig): Encoder configuration.
+            num_mel_bins (int): Number of Mel frequency bins.
+        """
         super().__init__()
-        self.validate_inputs(config.window_size, config.embedding_size)
+        if config.window_size <= 0 or config.embedding_size <= 0:
+            raise ValueError("Window size and embedding size must be positive integers")
         
-        self.conv1 = nn.Conv2d(1, config.conv1_channels, 
-                              kernel_size=config.kernel_size, 
-                              padding=config.padding)
-        self.conv2 = nn.Conv2d(config.conv1_channels, 
-                              config.conv2_channels, 
-                              kernel_size=config.kernel_size, 
-                              padding=config.padding)
-        self.pool = nn.MaxPool2d(kernel_size=config.pool_size)
-        self.flatten = nn.Flatten()
+        self.config = config
+        self.num_mel_bins = num_mel_bins
         
-        fc_input_size = self._calculate_fc_input_size(config.window_size, 
-                                                     num_mel_bins)
+        # Convolutional layers.
+        self.conv1 = nn.Conv2d(
+            in_channels=1,
+            out_channels=config.conv1_channels,
+            kernel_size=config.kernel_size,
+            padding=config.padding
+        )
+        self.conv2 = nn.Conv2d(
+            in_channels=config.conv1_channels,
+            out_channels=config.conv2_channels,
+            kernel_size=config.kernel_size,
+            padding=config.padding
+        )
         
-        self.fc1 = nn.Linear(fc_input_size, config.hidden_size)
+        # Adaptive average pooling to force the output to (1, 1) regardless of input size.
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Fully connected layers.
+        # After adaptive pooling, the feature map has shape (batch, conv2_channels, 1, 1)
+        # so the flattened feature vector has size conv2_channels.
+        self.fc1 = nn.Linear(config.conv2_channels, config.hidden_size)
         self.fc_mean = nn.Linear(config.hidden_size, config.embedding_size)
         self.fc_log_var = nn.Linear(config.hidden_size, config.embedding_size)
 
-    def _calculate_fc_input_size(self, window_size: int, num_mel_bins: int) -> int:
-        """Calculate the size for the fully connected layer."""
-        with torch.no_grad():
-            x = torch.zeros(1, 1, window_size, num_mel_bins)
-            x = self.pool(F.relu(self.conv1(x)))
-            x = self.pool(F.relu(self.conv2(x)))
-            return x.numel()
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass of the MelEncoder."""
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the MelEncoder.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch, window_size, num_mel_bins).
+        
+        Returns:
+            A tuple containing:
+                - sample (torch.Tensor): The sampled latent vector.
+                - z_mean (torch.Tensor): The mean of the latent distribution.
+                - z_log_var (torch.Tensor): The log variance of the latent distribution.
+        """
         if x.dim() != 3:
-            raise ValueError("Input tensor must have 3 dimensions")
-            
+            raise ValueError("Input tensor must have 3 dimensions (batch, window_size, num_mel_bins)")
+        
+        # Add the channel dimension: (batch, 1, window_size, num_mel_bins)
         x = x.unsqueeze(1)
-        x = self._encode(x)
-        z_mean = self.fc_mean(x)
-        z_log_var = self.fc_log_var(x)
-        sample = self.reparameterize(z_mean, z_log_var)
-        return sample, z_mean, z_log_var
-
-    def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode the input tensor."""
+        
+        # Pass through convolutional layers with ReLU activations.
         x = F.relu(self.conv1(x))
-        x = self.pool(x)
         x = F.relu(self.conv2(x))
-        x = self.pool(x)
-        x = self.flatten(x)
-        return F.relu(self.fc1(x))
+        
+        # Apply adaptive average pooling to obtain a fixed spatial size (1, 1).
+        x = self.adaptive_pool(x)
+        
+        # Flatten the tensor: shape becomes (batch, conv2_channels)
+        x = torch.flatten(x, start_dim=1)
+        
+        # Process through the fully connected layers.
+        hidden = F.relu(self.fc1(x))
+        z_mean = self.fc_mean(hidden)
+        z_log_var = self.fc_log_var(hidden)
+        
+        # Sample from the latent space using the reparameterization trick.
+        z = self.reparameterize(z_mean, z_log_var)
+        return z, z_mean, z_log_var
 
     def reparameterize(self, z_mean: torch.Tensor, z_log_var: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick to sample from the latent distribution."""
+        """
+        Reparameterization trick to sample from the latent distribution.
+        
+        Args:
+            z_mean (torch.Tensor): Mean of the latent distribution.
+            z_log_var (torch.Tensor): Log variance of the latent distribution.
+        
+        Returns:
+            torch.Tensor: A latent vector sample.
+        """
         std = torch.exp(0.5 * z_log_var)
         eps = torch.randn_like(std)
         return eps * std + z_mean
-    
 
+# ---------------------------------------------------------------------------
+# EnergyMapEncoder using AdaptiveAvgPool3d
+# ---------------------------------------------------------------------------
 
-class EnergyMapEncoder(BaseEncoder):
-    """Encoder for 3D Energy Map windows."""
-
+class EnergyMapEncoder(nn.Module):
+    """
+    Encoder for 3D Energy Map windows that uses AdaptiveAvgPool3d
+    to ensure a fixed-size feature vector prior to the fully connected layers.
+    """
     def __init__(self, config: EnergyMapConfig):
-        """Initialize the EnergyMapEncoder."""
-        super().__init__()
-        self.validate_inputs(config.window_size, config.embedding_size)
-        self._init_layers(config)
-
-    def _init_layers(self, config: EnergyMapConfig) -> None:
-        """Initialize neural network layers."""
-        self.conv1 = nn.Conv3d(1, config.conv1_channels, 
-                              kernel_size=config.kernel_size, 
-                              padding=config.padding)
-        self.conv2 = nn.Conv3d(config.conv1_channels, 
-                              config.conv2_channels, 
-                              kernel_size=config.kernel_size, 
-                              padding=config.padding)
-        self.pool = nn.MaxPool3d(kernel_size=config.pool_size)
-        self.flatten = nn.Flatten()
-
-        fc_input_size = self._calculate_fc_input_size(config)
+        """
+        Initialize the EnergyMapEncoder.
         
-        self.fc1 = nn.Linear(fc_input_size, config.hidden_size)
+        Args:
+            config (EnergyMapConfig): Configuration for the energy map encoder.
+        """
+        super().__init__()
+        if config.window_size <= 0 or config.embedding_size <= 0:
+            raise ValueError("Window size and embedding size must be positive integers")
+        
+        self.config = config
+        
+        # Convolutional layers.
+        self.conv1 = nn.Conv3d(
+            in_channels=1,
+            out_channels=config.conv1_channels,
+            kernel_size=config.kernel_size,
+            padding=config.padding
+        )
+        self.conv2 = nn.Conv3d(
+            in_channels=config.conv1_channels,
+            out_channels=config.conv2_channels,
+            kernel_size=config.kernel_size,
+            padding=config.padding
+        )
+        
+        # Adaptive average pooling to force the output to (1, 1, 1) regardless of input size.
+        self.adaptive_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        
+        # Fully connected layers.
+        # After adaptive pooling, the feature map has shape (batch, conv2_channels, 1, 1, 1)
+        # so the flattened feature vector has size conv2_channels.
+        self.fc1 = nn.Linear(config.conv2_channels, config.hidden_size)
         self.fc_mean = nn.Linear(config.hidden_size, config.embedding_size)
         self.fc_log_var = nn.Linear(config.hidden_size, config.embedding_size)
 
-    def _calculate_fc_input_size(self, config: EnergyMapConfig) -> int:
-        """Calculate the size for the fully connected layer."""
-        with torch.no_grad():
-            x = torch.zeros(1, 1, config.window_size, config.height, config.width)
-            x = self.pool(F.relu(self.conv1(x)))
-            x = self.pool(F.relu(self.conv2(x)))
-            return x.numel()
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward pass of the EnergyMapEncoder."""
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the EnergyMapEncoder.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch, window_size, height, width).
+        
+        Returns:
+            A tuple containing:
+                - sample (torch.Tensor): The sampled latent vector.
+                - z_mean (torch.Tensor): The mean of the latent distribution.
+                - z_log_var (torch.Tensor): The log variance of the latent distribution.
+        """
         if x.dim() != 4:
-            raise ValueError("Input tensor must have 4 dimensions")
-            
+            raise ValueError("Input tensor must have 4 dimensions (batch, window_size, height, width)")
+        
+        # Add the channel dimension: (batch, 1, window_size, height, width)
         x = x.unsqueeze(1)
-        x = self._encode(x)
-        z_mean = self.fc_mean(x)
-        z_log_var = self.fc_log_var(x)
-        sample = self.reparameterize(z_mean, z_log_var)
-        return sample, z_mean, z_log_var
-
-    def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode the input tensor."""
+        
+        # Pass through convolutional layers with ReLU activations.
         x = F.relu(self.conv1(x))
-        x = self.pool(x)
         x = F.relu(self.conv2(x))
-        x = self.pool(x)
-        x = self.flatten(x)
-        return F.relu(self.fc1(x))
+        
+        # Apply adaptive average pooling to obtain a fixed spatio-temporal size (1, 1, 1).
+        x = self.adaptive_pool(x)
+        
+        # Flatten the tensor: shape becomes (batch, conv2_channels)
+        x = torch.flatten(x, start_dim=1)
+        
+        # Process through the fully connected layers.
+        hidden = F.relu(self.fc1(x))
+        z_mean = self.fc_mean(hidden)
+        z_log_var = self.fc_log_var(hidden)
+        
+        # Sample from the latent space using the reparameterization trick.
+        z = self.reparameterize(z_mean, z_log_var)
+        return z, z_mean, z_log_var
 
     def reparameterize(self, z_mean: torch.Tensor, z_log_var: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick to sample from the latent distribution."""
+        """
+        Reparameterization trick to sample from the latent distribution.
+        
+        Args:
+            z_mean (torch.Tensor): Mean of the latent distribution.
+            z_log_var (torch.Tensor): Log variance of the latent distribution.
+        
+        Returns:
+            torch.Tensor: A latent vector sample.
+        """
         std = torch.exp(0.5 * z_log_var)
         eps = torch.randn_like(std)
         return eps * std + z_mean
+
+
+# ---------------------------------------------------------------------------
+#  Hierarchical Decoder
+# ---------------------------------------------------------------------------
 
 class HierarchicalDecoder(nn.Module):
-    """Hierarchical Decoder with Shared and Modality-Specific Layers."""
-
+    """
+    Hierarchical Decoder with Shared and Modality-Specific Layers.
+    
+    This revised decoder decouples the required final output shape from the
+    shape produced immediately by the FC layers. The decoder first maps the
+    latent vector to an intermediate feature map of a chosen resolution, and then
+    uses transposed convolutions and/or interpolation to achieve the final desired size.
+    """
+    
     def __init__(self, config: DecoderConfig):
-        """Initialize the HierarchicalDecoder."""
         super().__init__()
         self.config = config
-        self._init_shared_layers()
-        self._init_mel_layers()
-        self._init_energy_layers()
-
-    def _init_shared_layers(self) -> None:
-        """Initialize shared layers."""
-        self.shared_fc = nn.Linear(self.config.embedding_size * 2, 
-                                 self.config.hidden_size)
-        self.shared_fc2 = nn.Linear(self.config.hidden_size, 
-                                  self.config.shared_hidden_size)
-
-    def _init_mel_layers(self) -> None:
-        """Initialize Mel spectrogram specific layers."""
-        self.mel_fc = nn.Linear(self.config.shared_hidden_size, 
-                               self.config.hidden_size)
-        self.mel_unflatten = nn.Unflatten(
-            1, 
-            (self.config.conv_channels, 
-             self.config.window_size // 4, 
-             self.config.num_mel_bins // 4)
+        
+        # Shared layers that combine the two latent embeddings.
+        self.shared_fc = nn.Linear(config.embedding_size * 2, config.hidden_size)
+        self.shared_fc2 = nn.Linear(config.hidden_size, config.shared_hidden_size)
+        
+        # -------------------------
+        # Mel Branch Initialization
+        # -------------------------
+        # Instead of requiring that hidden_size = conv_channels * (window_size//4) * (num_mel_bins//4),
+        # we choose an intermediate resolution (e.g. config.mel_intermediate) that is flexible.
+        interm_h, interm_w = config.mel_intermediate
+        self.mel_intermediate_numel = config.conv_channels * interm_h * interm_w
+        
+        # Map shared features to a vector that we reshape into (conv_channels, interm_h, interm_w)
+        self.mel_fc = nn.Linear(config.shared_hidden_size, self.mel_intermediate_numel)
+        
+        # Two transposed conv layers to begin upsampling:
+        self.mel_deconv1 = nn.ConvTranspose2d(
+            in_channels=config.conv_channels,
+            out_channels=config.conv_channels // 2,
+            kernel_size=2,
+            stride=2
         )
-        self.mel_deconv1 = nn.ConvTranspose2d(self.config.conv_channels, 
-                                             self.config.conv_channels // 2, 
-                                             kernel_size=2, 
-                                             stride=2)
-        self.mel_deconv2 = nn.ConvTranspose2d(self.config.conv_channels // 2, 
-                                             1, 
-                                             kernel_size=2, 
-                                             stride=2)
-
-    def _init_energy_layers(self) -> None:
-        """Initialize energy map specific layers."""
-        self.energy_fc = nn.Linear(self.config.shared_hidden_size, 
-                                 self.config.hidden_size)
-        self.energy_unflatten = nn.Unflatten(
-            1, 
-            (self.config.conv_channels, 
-             self.config.window_size // 4, 
-             self.config.height // 4, 
-             self.config.width // 4)
+        self.mel_deconv2 = nn.ConvTranspose2d(
+            in_channels=config.conv_channels // 2,
+            out_channels=1,  # We want one channel for mel spectrogram reconstruction.
+            kernel_size=2,
+            stride=2
         )
-        self.energy_deconv1 = nn.ConvTranspose3d(self.config.conv_channels, 
-                                                self.config.conv_channels // 2, 
-                                                kernel_size=2, 
-                                                stride=2)
-        self.energy_deconv2 = nn.ConvTranspose3d(self.config.conv_channels // 2, 
-                                                1, 
-                                                kernel_size=2, 
-                                                stride=2)
+        
+        # -------------------------
+        # Energy Branch Initialization
+        # -------------------------
+        # Similarly, choose an intermediate resolution for the energy map.
+        interm_d, interm_h_e, interm_w_e = config.energy_intermediate
+        self.energy_intermediate_numel = config.conv_channels * interm_d * interm_h_e * interm_w_e
+        
+        self.energy_fc = nn.Linear(config.shared_hidden_size, self.energy_intermediate_numel)
+        
+        self.energy_deconv1 = nn.ConvTranspose3d(
+            in_channels=config.conv_channels,
+            out_channels=config.conv_channels // 2,
+            kernel_size=2,
+            stride=2
+        )
+        self.energy_deconv2 = nn.ConvTranspose3d(
+            in_channels=config.conv_channels // 2,
+            out_channels=1,  # One channel for the energy map.
+            kernel_size=2,
+            stride=2
+        )
 
     def _decode_mel(self, shared: torch.Tensor) -> torch.Tensor:
-        """Decode Mel spectrogram from shared representation."""
+        """
+        Decode the Mel spectrogram branch from the shared latent features.
+        This function uses a learned intermediate resolution and then adjusts
+        the output to the final (window_size, num_mel_bins) using interpolation.
+        """
+        # Map shared features to an intermediate vector.
         mel = F.relu(self.mel_fc(shared))
-        mel = self.mel_unflatten(mel)
+        batch_size = mel.size(0)
+        # Reshape to (batch, conv_channels, interm_h, interm_w)
+        interm_h, interm_w = self.config.mel_intermediate
+        mel = mel.view(batch_size, self.config.conv_channels, interm_h, interm_w)
+        
+        # Upsample using transposed convolutions.
         mel = F.relu(self.mel_deconv1(mel))
         mel = self.mel_deconv2(mel)
-        return mel.squeeze(1)
+        # At this point, the output spatial dimensions depend on the chosen intermediate size
+        # and the transposed convolutions’ parameters.
+        # To ensure we get exactly (window_size, num_mel_bins), use interpolation:
+        target_size = (self.config.window_size, self.config.num_mel_bins)
+        mel = F.interpolate(mel, size=target_size, mode='bilinear', align_corners=False)
+        
+        # Instead of a blind squeeze, check that the channel dimension is 1 before squeezing.
+        if mel.shape[1] == 1:
+            mel = mel.squeeze(1)
+        return mel
 
     def _decode_energy(self, shared: torch.Tensor) -> torch.Tensor:
-        """Decode energy map from shared representation."""
+        """
+        Decode the Energy map branch from the shared latent features.
+        Uses an intermediate resolution and interpolation to reach the desired
+        (window_size, height, width) shape.
+        """
         energy = F.relu(self.energy_fc(shared))
-        energy = self.energy_unflatten(energy)
+        batch_size = energy.size(0)
+        interm_d, interm_h, interm_w = self.config.energy_intermediate
+        # Reshape to (batch, conv_channels, interm_d, interm_h, interm_w)
+        energy = energy.view(batch_size, self.config.conv_channels, interm_d, interm_h, interm_w)
+        
         energy = F.relu(self.energy_deconv1(energy))
         energy = self.energy_deconv2(energy)
-        return energy.squeeze(1)
+        # Ensure final output has the desired spatial dimensions.
+        target_size = (self.config.window_size, self.config.height, self.config.width)
+        energy = F.interpolate(energy, size=target_size, mode='trilinear', align_corners=False)
+        
+        if energy.shape[1] == 1:
+            energy = energy.squeeze(1)
+        return energy
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass of the HierarchicalDecoder."""
+    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of the HierarchicalDecoder.
+        
+        Args:
+            z (torch.Tensor): Concatenated latent vector of shape (batch, embedding_size * 2)
+        
+        Returns:
+            A tuple containing:
+                - mel_recon (torch.Tensor): Reconstructed mel spectrogram with shape
+                  (batch, window_size, num_mel_bins)
+                - energy_recon (torch.Tensor): Reconstructed energy map with shape
+                  (batch, window_size, height, width)
+        """
         if z.dim() != 2:
             raise ValueError("Input tensor must have 2 dimensions")
-
+        
         shared = F.relu(self.shared_fc(z))
         shared = F.relu(self.shared_fc2(shared))
-
+        
         mel_recon = self._decode_mel(shared)
         energy_recon = self._decode_energy(shared)
-
+        
         return mel_recon, energy_recon
-    
+
+
+
+# ---------------------------------------------------------------------------
+#  MultiModal CVAE (May need modification)
+# ---------------------------------------------------------------------------    
 
 
 class MultiModalCVAE(nn.Module):
