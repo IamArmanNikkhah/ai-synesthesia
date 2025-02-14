@@ -1,7 +1,7 @@
 # decoder.py
 
-from common import spherical_harmonics_matrix
-from position import Position
+from .common import spherical_harmonics_matrix
+from .position import Position
 import numpy as np
 
 DECODING_METHODS = ['projection', 'pseudoinv']
