@@ -8,10 +8,10 @@ from matplotlib.colors import Normalize
 import cv2
 
 # Import custom modules
-from video import VideoWriter  # For video output
-from decoder import AmbiDecoder  # Ambisonic decoder
-from position import Position          # Position representation for grid points
-from ambi_format import AmbiFormat      # Ambisonic format class
+from .video import VideoWriter  # For video output
+from .decoder import AmbiDecoder  # Ambisonic decoder
+from .position import Position          # Position representation for grid points
+from .ambi_format import AmbiFormat      # Ambisonic format class
 
 
 class SphericalAmbisonicsVisualizer:
