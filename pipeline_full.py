@@ -19,7 +19,7 @@ from typing import Optional, List
 
 # Updated import paths based on project structure
 from utils.AudioExctractor.extract_audio import process_directory
-from utils.Mel-SpectrogramGenerator.melspectogramer import process_multiple_files, MelSpectrogram
+from utils.MelSpectrogramGenerator.melspectogramer import process_multiple_files, MelSpectrogram
 from utils.SpatialAudioMapper.sph_power_map import generate_spherical_power_map
 
 # Configure logging
